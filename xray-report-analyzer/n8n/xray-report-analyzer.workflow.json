@@ -1,0 +1,413 @@
+{
+  "id": "XrayReportAnal01",
+  "name": "X-Ray Report Analyzer — Multi-LLM Second Opinion (Research Prototype)",
+  "nodes": [
+    {
+      "name": "Intake Trigger",
+      "type": "n8n-nodes-base.formTrigger",
+      "typeVersion": 2.2,
+      "position": [
+        -1180,
+        0
+      ],
+      "webhookId": "xray-report-intake",
+      "parameters": {
+        "formTitle": "X-Ray Report Analyzer (Research Prototype)",
+        "formDescription": "Upload a DE-IDENTIFIED radiology report (.txt, .png, .jpg, .pdf). This is a research/educational tool — NOT a diagnostic device. Do not enter real patient-identifying information.",
+        "formFields": {
+          "values": [
+            {
+              "fieldLabel": "report",
+              "fieldType": "file",
+              "multipleFiles": false,
+              "acceptFileTypes": ".txt,.png,.jpg,.jpeg,.pdf",
+              "requiredField": true
+            },
+            {
+              "fieldLabel": "age",
+              "placeholder": "optional"
+            },
+            {
+              "fieldLabel": "sex",
+              "placeholder": "optional"
+            },
+            {
+              "fieldLabel": "history",
+              "fieldType": "textarea",
+              "placeholder": "optional relevant history (no identifiers)"
+            }
+          ]
+        },
+        "responseMode": "lastNode",
+        "options": {}
+      }
+    },
+    {
+      "name": "Preprocess",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -960,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Node 2 — Preprocess\n// Detects the uploaded file type, extracts/normalizes report text, runs the\n// PHI redaction pass, and builds the Gemini triage request body.\n//\n// OCR note (Assumption A6): the privacy-preserving default in the spec is local\n// Tesseract. Inside an n8n Code node there is no Tesseract binding, so this build\n// uses the spec's documented alternative — Gemini-vision OCR during triage — by\n// passing the image/PDF bytes inline to the triage call. To use local Tesseract\n// instead, front this workflow with the Execute Command variant described in the\n// README (docs/README section \"OCR modes\") so image bytes never leave the host.\n\nconst TRIAGE_PROMPT = `You are a medical triage router. Given a radiology report (and optionally its image),\nreturn STRICT JSON only:\n{\n  \"report_type\": \"<e.g. chest x-ray | skeletal/fracture | dental | abdominal | spine | other>\",\n  \"specialty_1\": \"<specialty best suited to review this>\",\n  \"specialty_2\": \"<a DIFFERENT relevant specialty>\",\n  \"specialty_3\": \"<a THIRD, distinct relevant specialty>\",\n  \"patient_context\": \"<echo any age/sex/history you can extract, else empty string>\",\n  \"report_text_normalized\": \"<the cleaned plain-text report>\"\n}\nIf an image or scanned document is attached instead of plain text, transcribe (OCR) its\ntext faithfully into \"report_text_normalized\" before classifying.\nPick three DISTINCT specialties that would give genuinely different perspectives.\nNo markdown, no commentary — JSON only.`;\n\n// Redaction pass — strips obvious identifiers BEFORE anything flows downstream\n// or is logged (spec sections 3.5 / 6). Heuristic, not a certified de-identifier:\n// all input data must already be de-identified per the mandatory safety rules.\nfunction redactPHI(text) {\n  if (!text) return text;\n  let t = String(text);\n  const rules = [\n    [/\\b(patient(?:\\s+name)?|name|pt\\.?)\\s*[:\\-]\\s*[A-Z][A-Za-z'\\-]+(?:[ ,]+[A-Z][A-Za-z'\\-]+)*/g, '$1: [REDACTED]'],\n    [/\\b(dob|date\\s+of\\s+birth|birth\\s*date)\\s*[:\\-]?\\s*\\d{1,4}[\\/\\-.]\\d{1,2}[\\/\\-.]\\d{1,4}/gi, '$1: [REDACTED]'],\n    [/\\b(mrn|medical\\s+record\\s+(?:no\\.?|number|#)|record\\s*#)\\s*[:\\-]?\\s*[A-Za-z0-9\\-]+/gi, '$1: [REDACTED]'],\n    [/\\b(accession\\s*(?:no\\.?|number|#)?)\\s*[:\\-]\\s*[A-Za-z0-9\\-]+/gi, '$1: [REDACTED]'],\n    [/\\b(ssn|social\\s+security(?:\\s+number)?)\\s*[:\\-]?\\s*\\d{3}-?\\d{2}-?\\d{4}/gi, '$1: [REDACTED]'],\n    [/\\b\\d{3}[\\-. ]\\d{3}[\\-. ]\\d{4}\\b/g, '[REDACTED-PHONE]'],\n    [/\\b[\\w.+-]+@[\\w-]+\\.[\\w.-]+\\b/g, '[REDACTED-EMAIL]'],\n  ];\n  for (const [re, rep] of rules) t = t.replace(re, rep);\n  return t;\n}\n\nconst item = items[0];\nconst j = item.json || {};\n\n// The Form Trigger exposes the uploaded file under a binary key named after the\n// form field; scan keys so a renamed field does not break intake.\nconst binKeys = Object.keys(item.binary || {});\nconst bin = binKeys.length ? item.binary[binKeys[0]] : null;\nif (!bin) {\n  throw new Error('No file was uploaded. The intake form requires a report file (.txt, .png, .jpg, .pdf).');\n}\n\nconst mime = (bin.mimeType || '').toLowerCase();\nconst fileName = (bin.fileName || '').toLowerCase();\n\nlet report_text = '';\nlet inline_b64 = null;   // image or PDF bytes forwarded ONLY to Gemini triage/specialist\nlet inline_mime = null;\nlet report_type_hint = '';\n\n// Resolve the real bytes via n8n's binary helper. `bin.data` is only the raw\n// base64 in the default in-memory mode; in filesystem/S3 modes it is a\n// reference, so decoding it directly yields garbage. getBinaryDataBuffer\n// returns the actual buffer in every mode.\nlet fileBuffer;\ntry {\n  fileBuffer = await this.helpers.getBinaryDataBuffer(0, binKeys[0]);\n} catch (e) {\n  // Fallback for contexts where the helper is unavailable (e.g. offline tests):\n  // treat bin.data as base64 only if it looks like base64.\n  fileBuffer = Buffer.from(bin.data || '', 'base64');\n}\n\nif (mime.startsWith('text/') || fileName.endsWith('.txt')) {\n  report_text = fileBuffer.toString('utf8');\n} else if (mime.startsWith('image/') || mime === 'application/pdf' || /\\.(png|jpe?g|pdf)$/.test(fileName)) {\n  inline_b64 = fileBuffer.toString('base64');\n  inline_mime = mime || (fileName.endsWith('.pdf') ? 'application/pdf' : 'image/png');\n} else {\n  throw new Error(`Unsupported file type \"${mime || fileName}\". Accepted: text/plain, image/png, image/jpeg, application/pdf.`);\n}\n\n// Only de-identified text flows downstream.\nreport_text = redactPHI(report_text);\n\nconst patient_context = [\n  j.age ? `age: ${j.age}` : null,\n  j.sex ? `sex: ${j.sex}` : null,\n  j.history ? `history: ${redactPHI(j.history)}` : null,\n].filter(Boolean).join('; ');\n\n// Cheap type hint used only as a fallback if triage output cannot be parsed.\nconst hintSource = (report_text + ' ' + fileName).toLowerCase();\nif (/chest|lung|cardiomediastin|pleural/.test(hintSource)) report_type_hint = 'chest x-ray';\nelse if (/fracture|femur|tibia|radius|humerus|bone/.test(hintSource)) report_type_hint = 'skeletal/fracture';\nelse if (/dental|panoramic|molar|mandib/.test(hintSource)) report_type_hint = 'dental';\nelse if (/abdom|bowel|kub/.test(hintSource)) report_type_hint = 'abdominal';\nelse if (/spine|vertebr|lumbar|cervical/.test(hintSource)) report_type_hint = 'spine';\nelse report_type_hint = 'other';\n\n// Build the Gemini triage request (Section 2.4.1 / Node 3).\nconst parts = [];\nconst userText = [\n  patient_context ? `PATIENT CONTEXT: ${patient_context}` : null,\n  report_text ? `REPORT TEXT:\\n\"\"\"\\n${report_text}\\n\"\"\"` : 'REPORT TEXT: (none — see attached scan; transcribe it)',\n].filter(Boolean).join('\\n\\n');\nparts.push({ text: userText });\nif (inline_b64) parts.push({ inlineData: { mimeType: inline_mime, data: inline_b64 } });\n\nconst triage_request_body = {\n  systemInstruction: { parts: [{ text: TRIAGE_PROMPT }] },\n  contents: [{ role: 'user', parts }],\n  generationConfig: { temperature: 0.2, responseMimeType: 'application/json' },\n};\n\nreturn [{\n  json: {\n    report_text,\n    patient_context,\n    report_type_hint,\n    image_b64: inline_mime && inline_mime.startsWith('image/') ? inline_b64 : null,\n    image_mime: inline_mime && inline_mime.startsWith('image/') ? inline_mime : null,\n    triage_request_body,\n    __t_start: Date.now(),\n  },\n}];\n"
+      }
+    },
+    {
+      "name": "Triage (Gemini)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -740,
+        0
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "=https://generativelanguage.googleapis.com/v1beta/models/{{ $env.GEMINI_TRIAGE_MODEL || 'gemini-2.5-flash' }}:generateContent",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "x-goog-api-key",
+              "value": "={{ $env.GEMINI_API_KEY }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.triage_request_body) }}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 2000
+    },
+    {
+      "name": "Parse Triage",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -520,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Node 4 — Parse Triage\n// Validates the triage JSON; on failure falls back to a default specialty triad\n// for the detected report_type_hint (the HTTP node already retried once).\n\nconst pre = $('Preprocess').first().json;\n\nconst DEFAULT_TRIADS = {\n  'chest x-ray': ['pulmonologist', 'thoracic radiologist', 'cardiothoracic surgeon'],\n  'skeletal/fracture': ['orthopedic surgeon', 'musculoskeletal radiologist', 'emergency physician'],\n  'dental': ['oral & maxillofacial radiologist', 'endodontist', 'oral surgeon'],\n  'abdominal': ['abdominal radiologist', 'gastroenterologist', 'general surgeon'],\n  'spine': ['neuroradiologist', 'spine surgeon', 'physiatrist'],\n  'other': ['diagnostic radiologist', 'internal medicine physician', 'emergency physician'],\n};\n\nfunction extractJson(raw) {\n  if (!raw) return null;\n  let s = String(raw).trim().replace(/^```(?:json)?\\s*/i, '').replace(/```\\s*$/, '');\n  const start = s.indexOf('{');\n  const end = s.lastIndexOf('}');\n  if (start === -1 || end <= start) return null;\n  try { return JSON.parse(s.slice(start, end + 1)); } catch (e) { return null; }\n}\n\nconst rawText = $json.candidates?.[0]?.content?.parts?.map(p => p.text || '').join('') ?? '';\nlet t = extractJson(rawText);\n\nlet triage_fallback_used = false;\nconst valid = t && typeof t === 'object'\n  && typeof t.report_type === 'string'\n  && [t.specialty_1, t.specialty_2, t.specialty_3].every(s => typeof s === 'string' && s.trim());\n\nif (!valid) {\n  triage_fallback_used = true;\n  const triad = DEFAULT_TRIADS[pre.report_type_hint] || DEFAULT_TRIADS.other;\n  t = {\n    report_type: pre.report_type_hint || 'other',\n    specialty_1: triad[0], specialty_2: triad[1], specialty_3: triad[2],\n    patient_context: pre.patient_context,\n    report_text_normalized: pre.report_text,\n  };\n}\n\n// Enforce three DISTINCT specialties; backfill duplicates from the default triad.\nconst triad = DEFAULT_TRIADS[t.report_type?.toLowerCase?.()] || DEFAULT_TRIADS[pre.report_type_hint] || DEFAULT_TRIADS.other;\nconst seen = new Set();\nconst specs = [t.specialty_1, t.specialty_2, t.specialty_3].map(s => String(s || '').trim());\nfor (let i = 0; i < 3; i++) {\n  const key = specs[i].toLowerCase();\n  if (!specs[i] || seen.has(key)) {\n    specs[i] = triad.find(d => !seen.has(d.toLowerCase())) || triad[i];\n  }\n  seen.add(specs[i].toLowerCase());\n}\n\nconst report_text = (t.report_text_normalized && String(t.report_text_normalized).trim())\n  ? String(t.report_text_normalized).trim()\n  : pre.report_text;\n\nif (!report_text) {\n  throw new Error('No report text could be extracted from the upload (empty file and OCR produced nothing).');\n}\n\nreturn [{\n  json: {\n    report_type: t.report_type || 'other',\n    specialty_1: specs[0],\n    specialty_2: specs[1],\n    specialty_3: specs[2],\n    patient_context: t.patient_context || pre.patient_context || '',\n    report_text,\n    image_b64: pre.image_b64,\n    image_mime: pre.image_mime,\n    triage_fallback_used,\n    __t_start: pre.__t_start,\n    __t_triage_ms: Date.now() - pre.__t_start,\n  },\n}];\n"
+      }
+    },
+    {
+      "name": "Fan-out Critiques",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -300,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Node 5 — Fan-out Critiques (Assumption A7: true concurrency via Promise.all)\n// Fires Gemini + Ollama + DeepSeek specialists concurrently, validates each\n// response against the SpecialistCritique schema, retries once with a stricter\n// JSON reminder on malformed output, and never lets one backend stall the run\n// (per-call timeout 30 s, hard branch ceiling 35 s).\n//\n// Credentials: n8n Code nodes cannot read the encrypted Credentials store, so\n// keys come from process environment variables set for the n8n service\n// (GEMINI_API_KEY, DEEPSEEK_API_KEY, OLLAMA_BASE_URL). The HTTP Request nodes in\n// this workflow (triage, synthesis) DO use the Credentials store. See README\n// \"Credentials & environment\".\n\nconst t = $json;\n\n// Ollama (local) is much slower than the cloud backends, so it gets its own,\n// longer per-call budget and the whole fan-out ceiling is sized to match.\nconst CALL_TIMEOUT_MS = 60000;                                   // gemini / deepseek\nconst OLLAMA_TIMEOUT_MS = Number($env.OLLAMA_TIMEOUT_MS || 115000);\nconst HARD_CEILING_MS = Number($env.XRAY_FANOUT_CEILING_MS || 120000);\n\n// When DeepSeek is unavailable (e.g. no account balance -> HTTP 402), route the\n// third specialist to Gemini instead. Matches the local runner's --no-deepseek.\nconst NO_DEEPSEEK = ['1', 'true', 'yes'].includes(String($env.XRAY_NO_DEEPSEEK || '').toLowerCase());\n\nconst GEMINI_MODEL = $env.GEMINI_SPECIALIST_MODEL || 'gemini-3.5-flash';\nconst OLLAMA_MODEL = $env.OLLAMA_MODEL || 'llama3.1:8b';\nconst DEEPSEEK_MODEL = $env.DEEPSEEK_SPECIALIST_MODEL || 'deepseek-v4-flash';\nconst OLLAMA_BASE = ($env.OLLAMA_BASE_URL || 'http://127.0.0.1:11434').replace(/\\/+$/, '');\n\n// ---------------------------------------------------------------- prompts ---\nconst SCHEMA_FIELDS_HELP = `The JSON object MUST have exactly these fields:\n{\n  \"specialty_role\": string,\n  \"key_observations\": string[],            // findings salient to your specialty, grounded in the source\n  \"areas_of_concern\": string[],            // ambiguous findings, missing views, absent priors, red flags\n  \"differential_considerations\": string[], // plausible diagnoses, most-to-least likely\n  \"confidence_level\": { \"level\": \"low\"|\"medium\"|\"high\", \"rationale\": string },\n  \"disagreements_with_original_report\": string[], // empty array if none\n  \"recommended_next_steps\": string[]\n}`;\n\nfunction specialistSystemPrompt(job) {\n  return `You are a board-certified ${job.specialty} reviewing a radiology report as a second-opinion\nconsultant. You are one of three independent specialists; you cannot see the others' opinions.\n\nYour job is to critique the report below from the specific viewpoint of a ${job.specialty} —\nnot to re-write it. Focus on what your specialty would notice, question, or add.\n\nINPUT YOU ARE GIVEN\n- Report type: ${t.report_type}\n- Patient context (may be partial or empty): ${t.patient_context || '(none provided)'}\n- Radiology report text:\n  \"\"\"\n  ${t.report_text}\n  \"\"\"\n${job.withImage ? '- An X-ray image is also attached for your direct inspection.' : ''}\n\nRULES\n1. Base every observation ONLY on the report text (and image, if attached). Do NOT invent findings,\n   measurements, or history that are not present or reasonably inferable from the input.\n2. If the report is text-only and you are a text model, analyze the WORDS of the report — do not\n   claim to have seen the image.\n3. If something important is missing from the report (e.g. no lateral view, no prior comparison),\n   say so under areas_of_concern.\n4. State your confidence honestly and explain it.\n5. Output STRICT JSON matching the schema. No markdown, no commentary outside the JSON.\n\n${SCHEMA_FIELDS_HELP}\n\nReturn ONLY the JSON object described in the schema.`;\n}\n\nfunction userPayload(job) {\n  return JSON.stringify({\n    specialty_role: job.specialty,\n    report_type: t.report_type,\n    patient_context: t.patient_context || '',\n    report_text: t.report_text,\n    image_provided: !!job.withImage,\n  });\n}\n\nconst STRICT_REMINDER = 'REMINDER: Your previous output was not valid. Return ONLY one valid JSON object exactly matching the schema — no markdown fences, no prose, no trailing text.';\n\n// ------------------------------------------------------- schema validation ---\n// Hand-rolled validator (external modules like ajv are not importable in a\n// stock n8n Code node). Mirrors schemas/specialist-critique.schema.json.\nfunction validateCritique(c) {\n  if (!c || typeof c !== 'object' || Array.isArray(c)) return false;\n  if (typeof c.specialty_role !== 'string' || !c.specialty_role.trim()) return false;\n  const strArr = k => Array.isArray(c[k]) && c[k].every(x => typeof x === 'string');\n  for (const k of ['key_observations', 'areas_of_concern', 'differential_considerations',\n                   'disagreements_with_original_report', 'recommended_next_steps']) {\n    if (!strArr(k)) return false;\n  }\n  const cl = c.confidence_level;\n  if (!cl || typeof cl !== 'object' || Array.isArray(cl)) return false;\n  if (!['low', 'medium', 'high'].includes(cl.level)) return false;\n  if (typeof cl.rationale !== 'string') return false;\n  return true;\n}\n\nfunction extractJson(raw) {\n  if (raw == null) return null;\n  let s = String(raw).trim().replace(/^```(?:json)?\\s*/i, '').replace(/```\\s*$/, '');\n  const start = s.indexOf('{');\n  const end = s.lastIndexOf('}');\n  if (start === -1 || end <= start) return null;\n  try { return JSON.parse(s.slice(start, end + 1)); } catch (e) { return null; }\n}\n\n// -------------------------------------------------------- request builders ---\n// Gemini-flavored response schema (enforced server-side, Section 2.4.1).\nconst GEMINI_RESPONSE_SCHEMA = {\n  type: 'object',\n  properties: {\n    specialty_role: { type: 'string' },\n    key_observations: { type: 'array', items: { type: 'string' } },\n    areas_of_concern: { type: 'array', items: { type: 'string' } },\n    differential_considerations: { type: 'array', items: { type: 'string' } },\n    confidence_level: {\n      type: 'object',\n      properties: {\n        level: { type: 'string', enum: ['low', 'medium', 'high'] },\n        rationale: { type: 'string' },\n      },\n      required: ['level', 'rationale'],\n    },\n    disagreements_with_original_report: { type: 'array', items: { type: 'string' } },\n    recommended_next_steps: { type: 'array', items: { type: 'string' } },\n  },\n  required: ['specialty_role', 'key_observations', 'areas_of_concern', 'differential_considerations',\n             'confidence_level', 'disagreements_with_original_report', 'recommended_next_steps'],\n};\n\nfunction buildRequest(job, strict) {\n  const sys = specialistSystemPrompt(job) + (strict ? '\\n\\n' + STRICT_REMINDER : '');\n  if (job.backend === 'gemini') {\n    if (!$env.GEMINI_API_KEY) throw new Error('GEMINI_API_KEY env var is not set for the n8n process');\n    const parts = [{ text: userPayload(job) }];\n    if (job.withImage) parts.push({ inlineData: { mimeType: t.image_mime || 'image/png', data: t.image_b64 } });\n    return {\n      method: 'POST',\n      url: `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`,\n      headers: { 'x-goog-api-key': $env.GEMINI_API_KEY, 'Content-Type': 'application/json' },\n      body: {\n        systemInstruction: { parts: [{ text: sys }] },\n        contents: [{ role: 'user', parts }],\n        generationConfig: {\n          temperature: 0.2,\n          responseMimeType: 'application/json',\n          responseSchema: GEMINI_RESPONSE_SCHEMA,\n        },\n      },\n      json: true,\n      timeout: CALL_TIMEOUT_MS,\n    };\n  }\n  if (job.backend === 'ollama') {\n    return {\n      method: 'POST',\n      url: `${OLLAMA_BASE}/api/chat`,\n      headers: { 'Content-Type': 'application/json' },\n      body: {\n        model: OLLAMA_MODEL,\n        messages: [\n          { role: 'system', content: sys },\n          { role: 'user', content: userPayload(job) },\n        ],\n        format: 'json',\n        stream: false,\n        options: { temperature: 0.2 },\n      },\n      json: true,\n      timeout: OLLAMA_TIMEOUT_MS,\n    };\n  }\n  if (job.backend === 'deepseek') {\n    if (!$env.DEEPSEEK_API_KEY) throw new Error('DEEPSEEK_API_KEY env var is not set for the n8n process');\n    return {\n      method: 'POST',\n      url: 'https://api.deepseek.com/chat/completions',\n      headers: { Authorization: `Bearer ${$env.DEEPSEEK_API_KEY}`, 'Content-Type': 'application/json' },\n      body: {\n        model: DEEPSEEK_MODEL,\n        messages: [\n          { role: 'system', content: sys },\n          { role: 'user', content: userPayload(job) },\n        ],\n        response_format: { type: 'json_object' },\n        temperature: 0.2,\n        thinking: { type: 'disabled' },\n      },\n      json: true,\n      timeout: CALL_TIMEOUT_MS,\n    };\n  }\n  throw new Error(`Unknown backend: ${job.backend}`);\n}\n\nfunction extractText(backend, raw) {\n  if (backend === 'gemini') return raw?.candidates?.[0]?.content?.parts?.map(p => p.text || '').join('') ?? '';\n  if (backend === 'ollama') return raw?.message?.content ?? '';\n  if (backend === 'deepseek') return raw?.choices?.[0]?.message?.content ?? '';\n  return '';\n}\n\n// ------------------------------------------------------------------ runner ---\nconst jobs = [\n  { backend: 'gemini', model: GEMINI_MODEL, specialty: t.specialty_1, withImage: !!t.image_b64 },\n  { backend: 'ollama', model: OLLAMA_MODEL, specialty: t.specialty_2, withImage: false },\n  NO_DEEPSEEK\n    ? { backend: 'gemini', model: GEMINI_MODEL, specialty: t.specialty_3, withImage: false }\n    : { backend: 'deepseek', model: DEEPSEEK_MODEL, specialty: t.specialty_3, withImage: false },\n];\n\n// Cloud backends occasionally return a transient 5xx/429 (e.g. Gemini 503\n// \"overloaded\"). Retry such calls once after a short backoff before giving up.\nfunction isTransient(e) {\n  const s = e && (e.statusCode || e.httpCode || e.status);\n  if (s && [429, 500, 502, 503, 504].includes(Number(s))) return true;\n  return /\\b(429|500|502|503|504)\\b|overloaded|ETIMEDOUT|ECONNRESET|socket hang up/i.test(String(e && e.message ? e.message : e));\n}\nasync function httpWithTransientRetry(req) {\n  try {\n    return await this.helpers.httpRequest(req);\n  } catch (e) {\n    if (!isTransient(e)) throw e;\n    await new Promise(r => setTimeout(r, 1500));\n    return await this.helpers.httpRequest(req);\n  }\n}\n\nconst callAgent = async (job) => {\n  const started = Date.now();\n  try {\n    const raw = await httpWithTransientRetry.call(this, buildRequest(job, false));\n    let critique = extractJson(extractText(job.backend, raw));\n    let rawText = extractText(job.backend, raw);\n    if (!validateCritique(critique)) {\n      // One retry with the stricter \"return ONLY valid JSON\" reminder (Section 2.6).\n      const raw2 = await httpWithTransientRetry.call(this, buildRequest(job, true));\n      rawText = extractText(job.backend, raw2);\n      critique = extractJson(rawText);\n    }\n    if (!validateCritique(critique)) {\n      return {\n        backend: job.backend, model: job.model, specialty: job.specialty,\n        parse_failed: true, raw_text_fallback: String(rawText).slice(0, 4000),\n        ms: Date.now() - started,\n      };\n    }\n    critique.__backend = job.backend;\n    critique.__model = job.model;\n    critique.__image_provided = !!job.withImage;\n    critique.__ms = Date.now() - started;\n    // Keep the persona honest even if the model paraphrased it.\n    critique.specialty_role = critique.specialty_role || job.specialty;\n    return critique;\n  } catch (e) {\n    return {\n      backend: job.backend, model: job.model, specialty: job.specialty,\n      failed: true, error: String(e && e.message ? e.message : e).slice(0, 500),\n      ms: Date.now() - started,\n    };\n  }\n};\n\n// Hard ceiling: the fan-out resolves when all three settle OR at HARD_CEILING_MS,\n// whichever comes first, so one hung backend cannot stall the pipeline.\nconst withCeiling = (p, job) => Promise.race([\n  p,\n  new Promise(res => setTimeout(() => res({\n    backend: job.backend, model: job.model, specialty: job.specialty,\n    failed: true, error: `branch ceiling ${HARD_CEILING_MS} ms exceeded`, ms: HARD_CEILING_MS,\n  }), HARD_CEILING_MS)),\n]);\n\nconst results = await Promise.all(jobs.map(j => withCeiling(callAgent(j), j)));\n\nconst critiques = results.filter(r => !r.failed && !r.parse_failed);\nconst failures = results.filter(r => r.failed || r.parse_failed);\n\nreturn [{\n  json: {\n    critiques,\n    failures,\n    original: {\n      report_text: t.report_text,\n      report_type: t.report_type,\n      patient_context: t.patient_context,\n      image_provided: !!t.image_b64,\n      triage_fallback_used: !!t.triage_fallback_used,\n      specialties: [t.specialty_1, t.specialty_2, t.specialty_3],\n    },\n    // Image bytes are intentionally dropped here — nothing downstream needs\n    // them and they must not be persisted (Section 4 / 6).\n    __t_start: t.__t_start,\n    __t_triage_ms: t.__t_triage_ms,\n    __t_fanout_ms: Math.max(...results.map(r => r.ms || r.__ms || 0)),\n    __agent_timings: results.map(r => ({\n      backend: r.backend || r.__backend, model: r.model || r.__model,\n      ms: r.ms || r.__ms, failed: !!r.failed, parse_failed: !!r.parse_failed,\n    })),\n  },\n}];\n"
+      }
+    },
+    {
+      "name": "Merge Guard",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -80,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Node 6 — Merge Guard\n// Assembles the available critiques, computes missing_critiques, and builds the\n// complete DeepSeek synthesis request body. If zero critiques survived, sets\n// has_critiques=false so the IF node short-circuits to the error report —\n// never a fabricated diagnosis (Section 2.6).\n\nconst DISCLAIMER = \"──────────────────────────────────────────────────────────────────────────\\n⚠  IMPORTANT — READ BEFORE USE\\nThis report was produced by an AI-assisted research/educational tool. It is\\nNOT a certified diagnostic device and must not be treated as one.\\n\\n• All output must be reviewed and confirmed by a licensed radiologist or\\n  physician before ANY clinical decision is made.\\n• This system must never be deployed to make diagnostic or treatment\\n  decisions autonomously. A qualified human must remain in the loop at all\\n  times.\\n• No real patient-identifying information should be entered, stored, or\\n  logged. All test and demonstration data must be de-identified.\\n──────────────────────────────────────────────────────────────────────────\";\n\n// When DeepSeek is unavailable (no balance -> HTTP 402), run synthesis on Gemini\n// instead (the faster triage-tier model). Matches the local runner --no-deepseek.\nconst NO_DEEPSEEK = ['1', 'true', 'yes'].includes(String($env.XRAY_NO_DEEPSEEK || '').toLowerCase());\n\nconst SYNTH_MODEL = $env.DEEPSEEK_SYNTHESIS_MODEL || 'deepseek-v4-pro';\nconst GEMINI_SYNTH_MODEL = $env.GEMINI_SYNTHESIS_MODEL || $env.GEMINI_TRIAGE_MODEL || 'gemini-2.5-flash';\n\nconst SYNTH_PROMPT = `You are the Chief Diagnostician. Three independent specialists have each critiqued the same\nradiology report. Your job is NOT to concatenate their opinions — it is to RECONCILE them.\n\nYou are given: the original report, and the specialist critique JSON objects that completed.\n\nDo the following:\n1. Identify where the specialists AGREE (same finding flagged by 2+ of them).\n2. Identify where they DISAGREE, and resolve each disagreement with explicit reasoning\n   (whose view is better supported by the report, and why). If it cannot be resolved from the\n   available evidence, say so and state what would resolve it.\n3. Weigh confidence: down-weight findings only one specialist raised; up-weight consensus findings.\n4. Account for missing critiques: if fewer than three critiques are present, lower overall\n   confidence and note which perspective is absent.\n5. Remember the analysis limitation: text-only agents did not view the image. Reflect this in\n   the confidence assessment.\n6. Produce a ranked differential and a single most-likely diagnosis (or \"no acute abnormality\"\n   if that is the supported conclusion).\n7. Attach the mandatory disclaimer block VERBATIM (provided below) as the \"disclaimer\" field.\n\nBase everything on the report and the critiques. Do NOT introduce findings none of the inputs\nsupport. Output STRICT JSON matching the final schema. No markdown, no text outside the JSON.\n\nThe JSON object MUST have exactly these fields:\n{\n  \"summary\": string,\n  \"primary_findings\": string[],\n  \"points_of_agreement\": string[],\n  \"points_of_disagreement_and_resolution\": [ { \"point\": string, \"positions\": string[], \"resolution\": string } ],\n  \"most_likely_diagnosis\": string,\n  \"differential_diagnoses_ranked\": [ { \"diagnosis\": string, \"likelihood\": \"high\"|\"moderate\"|\"low\", \"supporting_rationale\": string } ],\n  \"confidence_assessment\": { \"overall_confidence\": \"low\"|\"medium\"|\"high\", \"rationale\": string, \"analysis_limitations\": string[] },\n  \"recommended_next_clinical_steps\": string[],\n  \"contributing_specialties\": string[],\n  \"missing_critiques\": string[],\n  \"disclaimer\": string   // the mandatory disclaimer, copied VERBATIM\n}\n\nMANDATORY DISCLAIMER (copy verbatim into the \"disclaimer\" field):\n${DISCLAIMER}`;\n\nconst critiques = ($json.critiques || []).map(c => {\n  // Strip internal bookkeeping before showing critiques to the synthesis model.\n  const { __backend, __model, __ms, __image_provided, ...clean } = c;\n  return { ...clean, backend: __backend, analyzed_image: !!__image_provided };\n});\n\nconst missing_critiques = ($json.failures || []).map(f =>\n  `${f.backend} (${f.specialty || 'specialist'})${f.parse_failed ? ' — returned malformed output' : ''}${f.error ? ` — ${f.error}` : ''}`\n);\n\nconst merged = {\n  original_report: $json.original.report_text,\n  report_type: $json.original.report_type,\n  patient_context: $json.original.patient_context,\n  critiques,\n  missing_critiques,\n};\n\n// Build the request for whichever synthesis backend is active. The Synthesis\n// HTTP node reads synthesis_url / synthesis_auth_name / synthesis_auth_value /\n// synthesis_request_body from here, so switching backends needs no node edits.\nlet synthesis_request_body, synthesis_url, synthesis_auth_name, synthesis_auth_value, synthesis_backend;\n\nif (NO_DEEPSEEK) {\n  synthesis_backend = 'gemini';\n  synthesis_url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_SYNTH_MODEL}:generateContent`;\n  synthesis_auth_name = 'x-goog-api-key';\n  synthesis_auth_value = $env.GEMINI_API_KEY || '';\n  synthesis_request_body = {\n    systemInstruction: { parts: [{ text: SYNTH_PROMPT }] },\n    contents: [{ role: 'user', parts: [{ text: JSON.stringify(merged) }] }],\n    generationConfig: { temperature: 0.2, responseMimeType: 'application/json' },\n  };\n} else {\n  synthesis_backend = 'deepseek';\n  synthesis_url = 'https://api.deepseek.com/chat/completions';\n  synthesis_auth_name = 'Authorization';\n  synthesis_auth_value = `Bearer ${$env.DEEPSEEK_API_KEY || ''}`;\n  synthesis_request_body = {\n    model: SYNTH_MODEL,\n    messages: [\n      { role: 'system', content: SYNTH_PROMPT },\n      { role: 'user', content: JSON.stringify(merged) },\n    ],\n    response_format: { type: 'json_object' },\n    reasoning_effort: 'high',\n    thinking: { type: 'enabled' },\n  };\n}\n\nreturn [{\n  json: {\n    has_critiques: critiques.length > 0,\n    synthesis_request_body,\n    synthesis_url,\n    synthesis_auth_name,\n    synthesis_auth_value,\n    synthesis_backend,\n    merged,\n    original: $json.original,\n    failures: $json.failures || [],\n    __t_start: $json.__t_start,\n    __t_triage_ms: $json.__t_triage_ms,\n    __t_fanout_ms: $json.__t_fanout_ms,\n    __agent_timings: $json.__agent_timings,\n  },\n}];\n"
+      }
+    },
+    {
+      "name": "Any Critiques?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        140,
+        0
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "leftValue": "={{ $json.has_critiques }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "name": "Synthesis (DeepSeek)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        360,
+        -100
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.synthesis_url }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "={{ $json.synthesis_auth_name }}",
+              "value": "={{ $json.synthesis_auth_value }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.synthesis_request_body) }}",
+        "options": {
+          "timeout": 120000
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 3000,
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true
+    },
+    {
+      "name": "Parse & Validate Final",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        580,
+        -100
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Node 8 — Parse & Validate Final\n// Extracts choices[0].message.content, validates against FinalDiagnosticReport,\n// re-inserts the Section 6 disclaimer VERBATIM (hard requirement), strips any\n// reasoning_content, and — per Section 2.6 — if synthesis failed after its\n// retry, returns the raw critiques plus an explicit \"synthesis unavailable\"\n// notice. The disclaimer is never dropped.\n\nconst DISCLAIMER = \"──────────────────────────────────────────────────────────────────────────\\n⚠  IMPORTANT — READ BEFORE USE\\nThis report was produced by an AI-assisted research/educational tool. It is\\nNOT a certified diagnostic device and must not be treated as one.\\n\\n• All output must be reviewed and confirmed by a licensed radiologist or\\n  physician before ANY clinical decision is made.\\n• This system must never be deployed to make diagnostic or treatment\\n  decisions autonomously. A qualified human must remain in the loop at all\\n  times.\\n• No real patient-identifying information should be entered, stored, or\\n  logged. All test and demonstration data must be de-identified.\\n──────────────────────────────────────────────────────────────────────────\";\n\nconst mg = $('Merge Guard').first().json;\nconst resp = $json;\n\nfunction extractJson(raw) {\n  if (raw == null) return null;\n  let s = String(raw).trim().replace(/^```(?:json)?\\s*/i, '').replace(/```\\s*$/, '');\n  const start = s.indexOf('{');\n  const end = s.lastIndexOf('}');\n  if (start === -1 || end <= start) return null;\n  try { return JSON.parse(s.slice(start, end + 1)); } catch (e) { return null; }\n}\n\nconst strArr = v => (Array.isArray(v) ? v.filter(x => typeof x === 'string') : []);\n\nlet final = null;\nlet synthesis_unavailable = false;\nlet synthesis_error = '';\n\nif (resp.error) {\n  // HTTP node was set to continue-on-fail; the error object lands here after\n  // its built-in retry was exhausted.\n  synthesis_unavailable = true;\n  synthesis_error = String(resp.error.message || resp.error).slice(0, 500);\n} else {\n  // Accept both response shapes: DeepSeek/OpenAI (choices[].message.content) and\n  // Gemini (candidates[].content.parts[].text), so either synthesis backend works.\n  const content = resp.choices?.[0]?.message?.content\n    ?? resp.candidates?.[0]?.content?.parts?.map(p => p.text || '').join('')\n    ?? '';\n  final = extractJson(content);\n  if (!final) {\n    synthesis_unavailable = true;\n    synthesis_error = 'synthesis model returned malformed JSON';\n  }\n}\n\nconst contributing = (mg.merged.critiques || []).map(c => `${c.specialty_role} (${c.backend})`);\n\nif (synthesis_unavailable) {\n  // Fallback report: raw critiques + explicit notice, disclaimer attached.\n  final = {\n    summary: 'SYNTHESIS UNAVAILABLE — the reconciliation step failed after retry. The raw, ' +\n      'unreconciled specialist critiques are attached below. No synthesized conclusion is offered.',\n    primary_findings: (mg.merged.critiques || []).flatMap(c =>\n      strArr(c.key_observations).map(o => `[${c.specialty_role}] ${o}`)),\n    points_of_agreement: [],\n    points_of_disagreement_and_resolution: [],\n    most_likely_diagnosis: 'Not determined — synthesis unavailable.',\n    differential_diagnoses_ranked: [],\n    confidence_assessment: {\n      overall_confidence: 'low',\n      rationale: `The synthesis backend failed (${synthesis_error}); individual critiques were not reconciled.`,\n      analysis_limitations: [],\n    },\n    recommended_next_clinical_steps: [\n      'Have a licensed radiologist or physician review the original report and the raw critiques directly.',\n    ],\n    contributing_specialties: contributing,\n    missing_critiques: mg.merged.missing_critiques || [],\n    disclaimer: DISCLAIMER,\n    raw_critiques: mg.merged.critiques,\n  };\n}\n\n// ---- Shape enforcement (FinalDiagnosticReport schema) -----------------------\nfinal.summary = typeof final.summary === 'string' ? final.summary : '';\nfinal.primary_findings = strArr(final.primary_findings);\nfinal.points_of_agreement = strArr(final.points_of_agreement);\nfinal.points_of_disagreement_and_resolution =\n  (Array.isArray(final.points_of_disagreement_and_resolution) ? final.points_of_disagreement_and_resolution : [])\n    .filter(d => d && typeof d === 'object')\n    .map(d => ({\n      point: String(d.point || ''),\n      positions: strArr(d.positions),\n      resolution: String(d.resolution || ''),\n    }));\nfinal.most_likely_diagnosis = typeof final.most_likely_diagnosis === 'string'\n  ? final.most_likely_diagnosis : 'Not determined.';\nfinal.differential_diagnoses_ranked =\n  (Array.isArray(final.differential_diagnoses_ranked) ? final.differential_diagnoses_ranked : [])\n    .filter(d => d && typeof d === 'object')\n    .map(d => ({\n      diagnosis: String(d.diagnosis || ''),\n      likelihood: ['high', 'moderate', 'low'].includes(d.likelihood) ? d.likelihood : 'low',\n      supporting_rationale: String(d.supporting_rationale || ''),\n    }));\n\nconst ca = (final.confidence_assessment && typeof final.confidence_assessment === 'object')\n  ? final.confidence_assessment : {};\nfinal.confidence_assessment = {\n  overall_confidence: ['low', 'medium', 'high'].includes(ca.overall_confidence) ? ca.overall_confidence : 'low',\n  rationale: String(ca.rationale || ''),\n  analysis_limitations: strArr(ca.analysis_limitations),\n};\n\n// Honest-limitations guarantee (Section 6): these two disclosures must always\n// be present, whether or not the model included them.\nconst lims = final.confidence_assessment.analysis_limitations;\nconst textOnlyCount = (mg.merged.critiques || []).filter(c => !c.analyzed_image).length;\nconst imgNote = mg.original.image_provided\n  ? `${textOnlyCount} of ${(mg.merged.critiques || []).length} completed specialist agents analyzed the report text only, not the image.`\n  : 'No image was provided; all agents analyzed the report text only.';\nif (!lims.some(l => /text[- ]only|report text only|not the image|no image/i.test(l))) lims.push(imgNote);\nif (!lims.some(l => /FDA|CE[- ]cleared|not.*(certified|cleared)/i.test(l))) {\n  lims.push('This tool is a research/educational prototype and is not FDA/CE-cleared.');\n}\n\nfinal.recommended_next_clinical_steps = strArr(final.recommended_next_clinical_steps);\nfinal.contributing_specialties = strArr(final.contributing_specialties);\nif (final.contributing_specialties.length === 0) final.contributing_specialties = contributing;\nfinal.missing_critiques = strArr(final.missing_critiques);\nfor (const m of (mg.merged.missing_critiques || [])) {\n  if (!final.missing_critiques.includes(m)) final.missing_critiques.push(m);\n}\n\n// Hard requirement: disclaimer present and VERBATIM — overwrite unconditionally.\nfinal.disclaimer = DISCLAIMER;\n\n// Never persist or echo the model's thinking trace.\ndelete final.reasoning_content;\n\nreturn [{\n  json: {\n    final_report: final,\n    error_report: false,\n    synthesis_unavailable,\n    synthesis_error,\n    original: mg.original,\n    __t_start: mg.__t_start,\n    __t_triage_ms: mg.__t_triage_ms,\n    __t_fanout_ms: mg.__t_fanout_ms,\n    __t_synthesis_ms: Date.now() - (mg.__t_start + (mg.__t_triage_ms || 0) + (mg.__t_fanout_ms || 0)),\n    __agent_timings: mg.__agent_timings,\n    __synthesis_usage: resp.usage || resp.usageMetadata || null,\n  },\n}];\n"
+      }
+    },
+    {
+      "name": "Error Report",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        360,
+        140
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Node — Error Report (zero valid critiques)\n// Mandated by Section 2.6: never fabricate a diagnosis. Returns an explicit\n// \"analysis could not be completed\" report with the disclaimer still attached.\n\nconst DISCLAIMER = \"──────────────────────────────────────────────────────────────────────────\\n⚠  IMPORTANT — READ BEFORE USE\\nThis report was produced by an AI-assisted research/educational tool. It is\\nNOT a certified diagnostic device and must not be treated as one.\\n\\n• All output must be reviewed and confirmed by a licensed radiologist or\\n  physician before ANY clinical decision is made.\\n• This system must never be deployed to make diagnostic or treatment\\n  decisions autonomously. A qualified human must remain in the loop at all\\n  times.\\n• No real patient-identifying information should be entered, stored, or\\n  logged. All test and demonstration data must be de-identified.\\n──────────────────────────────────────────────────────────────────────────\";\n\nconst failures = $json.failures || [];\n\nconst final_report = {\n  summary: 'Analysis could not be completed — no specialist critiques were produced. ' +\n    'All three specialist backends failed or returned unusable output. No diagnostic ' +\n    'conclusion is offered.',\n  primary_findings: [],\n  points_of_agreement: [],\n  points_of_disagreement_and_resolution: [],\n  most_likely_diagnosis: 'Not determined — analysis could not be completed.',\n  differential_diagnoses_ranked: [],\n  confidence_assessment: {\n    overall_confidence: 'low',\n    rationale: 'No specialist critique completed; there is no basis for any conclusion.',\n    analysis_limitations: [\n      'Zero of three specialist agents produced a valid critique.',\n      'This tool is a research/educational prototype and is not FDA/CE-cleared.',\n    ],\n  },\n  recommended_next_clinical_steps: [\n    'Have the original report reviewed directly by a licensed radiologist or physician.',\n    'Retry the analysis once backend availability is restored.',\n  ],\n  contributing_specialties: [],\n  missing_critiques: failures.map(f =>\n    `${f.backend} (${f.specialty || 'specialist'})${f.parse_failed ? ' — returned malformed output' : ''}${f.error ? ` — ${f.error}` : ''}`\n  ),\n  disclaimer: DISCLAIMER,\n};\n\nreturn [{\n  json: {\n    final_report,\n    error_report: true,\n    synthesis_unavailable: false,\n    original: $json.original,\n    __t_start: $json.__t_start,\n    __t_triage_ms: $json.__t_triage_ms,\n    __t_fanout_ms: $json.__t_fanout_ms,\n    __t_synthesis_ms: 0,\n    __agent_timings: $json.__agent_timings,\n  },\n}];\n"
+      }
+    },
+    {
+      "name": "Render Report",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        800,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Node 9 — Render Report\n// Renders the FinalDiagnosticReport JSON to markdown in the Section 7 layout\n// order, with the disclaimer as a visually distinct block at BOTH top and\n// bottom. HTML/PDF renderers can be added behind config flags (see README).\n\nconst r = $json.final_report;\n\nconst lines = [];\nconst section = (title) => { lines.push(''); lines.push(`## ${title}`); lines.push(''); };\nconst bullets = (arr, empty) => {\n  if (!arr || arr.length === 0) { lines.push(`_${empty}_`); return; }\n  for (const x of arr) lines.push(`- ${x}`);\n};\nconst disclaimerBlock = () => {\n  lines.push('```text');\n  lines.push(r.disclaimer);\n  lines.push('```');\n};\n\nlines.push('# AI-Assisted X-Ray Report Analysis (Research Prototype)');\nlines.push('');\ndisclaimerBlock();\n\nsection('Summary');\nlines.push(r.summary || '_No summary produced._');\n\nsection('Primary Findings');\nbullets(r.primary_findings, 'None reported.');\n\nsection('Points of Agreement');\nbullets(r.points_of_agreement, 'None identified.');\n\nsection('Points of Disagreement & Resolution');\nif (!r.points_of_disagreement_and_resolution || r.points_of_disagreement_and_resolution.length === 0) {\n  lines.push('_No disagreements between specialists._');\n} else {\n  for (const d of r.points_of_disagreement_and_resolution) {\n    lines.push(`- **Point:** ${d.point}`);\n    for (const p of (d.positions || [])) lines.push(`  - Position: ${p}`);\n    lines.push(`  - **Resolution:** ${d.resolution}`);\n  }\n}\n\nsection('Most Likely Diagnosis');\nlines.push(`**${r.most_likely_diagnosis}**`);\n\nsection('Differential Diagnoses (Ranked)');\nif (!r.differential_diagnoses_ranked || r.differential_diagnoses_ranked.length === 0) {\n  lines.push('_None offered._');\n} else {\n  lines.push('| # | Diagnosis | Likelihood | Supporting rationale |');\n  lines.push('|---|-----------|------------|----------------------|');\n  r.differential_diagnoses_ranked.forEach((d, i) => {\n    const esc = s => String(s || '').replace(/\\|/g, '\\\\|').replace(/\\n/g, ' ');\n    lines.push(`| ${i + 1} | ${esc(d.diagnosis)} | ${d.likelihood} | ${esc(d.supporting_rationale)} |`);\n  });\n}\n\nsection('Confidence Assessment');\nlines.push(`**Overall confidence:** ${r.confidence_assessment.overall_confidence}`);\nlines.push('');\nlines.push(r.confidence_assessment.rationale || '');\nlines.push('');\nlines.push('**Analysis limitations:**');\nbullets(r.confidence_assessment.analysis_limitations, 'None stated.');\n\nsection('Recommended Next Clinical Steps');\nbullets(r.recommended_next_clinical_steps, 'None offered.');\n\nsection('Contributing Specialties');\nbullets(r.contributing_specialties, 'None — no critiques completed.');\nif (r.missing_critiques && r.missing_critiques.length > 0) {\n  lines.push('');\n  lines.push('**Missing critiques (failed or timed out):**');\n  bullets(r.missing_critiques, '');\n}\n\nif ($json.synthesis_unavailable && r.raw_critiques) {\n  section('Raw Specialist Critiques (synthesis unavailable)');\n  lines.push('```json');\n  lines.push(JSON.stringify(r.raw_critiques, null, 2));\n  lines.push('```');\n}\n\nlines.push('');\nlines.push('---');\nlines.push('');\ndisclaimerBlock();\n\n// ---- HTML rendering (for the Form completion page, respondWith=showText) ----\nconst esc = (s) => String(s == null ? '' : s)\n  .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');\nconst h = [];\nconst ul = (arr, empty) => {\n  if (!arr || arr.length === 0) { h.push(`<p class=\"muted\">${empty}</p>`); return; }\n  h.push('<ul>' + arr.map(x => `<li>${esc(x)}</li>`).join('') + '</ul>');\n};\nconst disclaimerHtml = () =>\n  `<pre class=\"disclaimer\">${esc(r.disclaimer)}</pre>`;\n\nh.push(`<style>\n  .xray{max-width:820px;margin:0 auto;padding:24px;font-family:-apple-system,Segoe UI,Roboto,sans-serif;line-height:1.5;color:#1a1a1a}\n  .xray h1{font-size:1.5rem} .xray h2{font-size:1.1rem;margin-top:1.6rem;border-bottom:1px solid #e5e5e5;padding-bottom:4px}\n  .xray pre.disclaimer{background:#fff7d6;border:2px solid #e0b500;border-radius:8px;padding:14px;white-space:pre-wrap;font-family:ui-monospace,monospace;font-size:.82rem}\n  .xray table{border-collapse:collapse;width:100%;font-size:.9rem} .xray th,.xray td{border:1px solid #ddd;padding:6px 8px;text-align:left;vertical-align:top}\n  .xray .muted{color:#888;font-style:italic} .xray .diag{font-size:1.15rem;font-weight:600;color:#0b5}\n  .xray .conf{display:inline-block;padding:2px 10px;border-radius:12px;background:#eef;font-weight:600}\n</style>`);\nh.push('<div class=\"xray\">');\nh.push('<h1>AI-Assisted X-Ray Report Analysis <span class=\"muted\">(Research Prototype)</span></h1>');\nh.push(disclaimerHtml());\nh.push('<h2>Summary</h2>'); h.push(`<p>${esc(r.summary) || '<span class=\"muted\">No summary produced.</span>'}</p>`);\nh.push('<h2>Primary Findings</h2>'); ul(r.primary_findings, 'None reported.');\nh.push('<h2>Points of Agreement</h2>'); ul(r.points_of_agreement, 'None identified.');\nh.push('<h2>Points of Disagreement &amp; Resolution</h2>');\nif (!r.points_of_disagreement_and_resolution || r.points_of_disagreement_and_resolution.length === 0) {\n  h.push('<p class=\"muted\">No disagreements between specialists.</p>');\n} else {\n  for (const d of r.points_of_disagreement_and_resolution) {\n    h.push(`<p><strong>${esc(d.point)}</strong></p><ul>` +\n      (d.positions || []).map(p => `<li>${esc(p)}</li>`).join('') +\n      `</ul><p><em>Resolution:</em> ${esc(d.resolution)}</p>`);\n  }\n}\nh.push('<h2>Most Likely Diagnosis</h2>'); h.push(`<p class=\"diag\">${esc(r.most_likely_diagnosis)}</p>`);\nh.push('<h2>Differential Diagnoses (Ranked)</h2>');\nif (!r.differential_diagnoses_ranked || r.differential_diagnoses_ranked.length === 0) {\n  h.push('<p class=\"muted\">None offered.</p>');\n} else {\n  h.push('<table><tr><th>#</th><th>Diagnosis</th><th>Likelihood</th><th>Rationale</th></tr>' +\n    r.differential_diagnoses_ranked.map((d, i) =>\n      `<tr><td>${i + 1}</td><td>${esc(d.diagnosis)}</td><td>${esc(d.likelihood)}</td><td>${esc(d.supporting_rationale)}</td></tr>`).join('') +\n    '</table>');\n}\nh.push('<h2>Confidence Assessment</h2>');\nh.push(`<p><span class=\"conf\">${esc(r.confidence_assessment.overall_confidence)}</span></p>`);\nh.push(`<p>${esc(r.confidence_assessment.rationale)}</p>`);\nh.push('<p><strong>Analysis limitations:</strong></p>'); ul(r.confidence_assessment.analysis_limitations, 'None stated.');\nh.push('<h2>Recommended Next Clinical Steps</h2>'); ul(r.recommended_next_clinical_steps, 'None offered.');\nh.push('<h2>Contributing Specialties</h2>'); ul(r.contributing_specialties, 'None — no critiques completed.');\nif (r.missing_critiques && r.missing_critiques.length > 0) {\n  h.push('<p><strong>Missing critiques (failed or timed out):</strong></p>'); ul(r.missing_critiques, '');\n}\nh.push('<hr>'); h.push(disclaimerHtml());\nh.push('</div>');\nconst html = h.join('\\n');\n\nreturn [{\n  json: {\n    markdown: lines.join('\\n'),\n    html,\n    final_report: r,\n    error_report: $json.error_report,\n    synthesis_unavailable: $json.synthesis_unavailable,\n    synthesis_error: $json.synthesis_error || '',\n    original: $json.original,\n    __t_start: $json.__t_start,\n    __t_triage_ms: $json.__t_triage_ms,\n    __t_fanout_ms: $json.__t_fanout_ms,\n    __t_synthesis_ms: $json.__t_synthesis_ms,\n    __agent_timings: $json.__agent_timings,\n    __synthesis_usage: $json.__synthesis_usage || null,\n  },\n}];\n"
+      }
+    },
+    {
+      "name": "Audit Log",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1020,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Node 10 — Audit Log\n// Appends a redacted, PHI-free record per run to <XRAY_OUT_DIR>/audit.jsonl and\n// saves the rendered (already de-identified) report next to it.\n//\n// Retained: timings, model IDs, token counts, error/parse flags, redacted output.\n// NEVER retained: raw uploaded files, image bytes, reasoning_content, identifiers.\n//\n// Requires the n8n process env var: NODE_FUNCTION_ALLOW_BUILTIN=fs,path\n// (see README). Logging must never break the pipeline: all failures here are\n// swallowed after a console warning.\n\nfunction redactPHI(text) {\n  if (!text) return text;\n  let t = String(text);\n  const rules = [\n    [/\\b(patient(?:\\s+name)?|name|pt\\.?)\\s*[:\\-]\\s*[A-Z][A-Za-z'\\-]+(?:[ ,]+[A-Z][A-Za-z'\\-]+)*/g, '$1: [REDACTED]'],\n    [/\\b(dob|date\\s+of\\s+birth|birth\\s*date)\\s*[:\\-]?\\s*\\d{1,4}[\\/\\-.]\\d{1,2}[\\/\\-.]\\d{1,4}/gi, '$1: [REDACTED]'],\n    [/\\b(mrn|medical\\s+record\\s+(?:no\\.?|number|#)|record\\s*#)\\s*[:\\-]?\\s*[A-Za-z0-9\\-]+/gi, '$1: [REDACTED]'],\n    [/\\b(accession\\s*(?:no\\.?|number|#)?)\\s*[:\\-]\\s*[A-Za-z0-9\\-]+/gi, '$1: [REDACTED]'],\n    [/\\b(ssn|social\\s+security(?:\\s+number)?)\\s*[:\\-]?\\s*\\d{3}-?\\d{2}-?\\d{4}/gi, '$1: [REDACTED]'],\n    [/\\b\\d{3}[\\-. ]\\d{3}[\\-. ]\\d{4}\\b/g, '[REDACTED-PHONE]'],\n    [/\\b[\\w.+-]+@[\\w-]+\\.[\\w.-]+\\b/g, '[REDACTED-EMAIL]'],\n  ];\n  for (const [re, rep] of rules) t = t.replace(re, rep);\n  return t;\n}\n\nconst j = $json;\n\nconst record = {\n  timestamp: new Date().toISOString(),\n  execution_id: $execution.id,\n  report_type: j.original ? j.original.report_type : null,\n  triage_ms: j.__t_triage_ms || null,\n  fanout_ms: j.__t_fanout_ms || null,\n  synthesis_ms: j.__t_synthesis_ms || null,\n  total_ms: j.__t_start ? Date.now() - j.__t_start : null,\n  agents: j.__agent_timings || [],\n  synthesis_usage: j.__synthesis_usage\n    ? { prompt_tokens: j.__synthesis_usage.prompt_tokens, completion_tokens: j.__synthesis_usage.completion_tokens }\n    : null,\n  error_report: !!j.error_report,\n  synthesis_unavailable: !!j.synthesis_unavailable,\n  synthesis_error: j.synthesis_error || null,\n  missing_critiques: (j.final_report && j.final_report.missing_critiques) || [],\n  overall_confidence: j.final_report ? j.final_report.confidence_assessment.overall_confidence : null,\n  most_likely_diagnosis: j.final_report ? redactPHI(j.final_report.most_likely_diagnosis) : null,\n  summary_redacted: j.final_report ? redactPHI(j.final_report.summary) : null,\n  // Evaluation-plan fields (Section 5.3/5.4) — filled in manually per test run.\n  eval: { agreement_rate: null, hallucinations: null, rubric: { plausibility: null, consistency: null, clarity: null } },\n};\n\ntry {\n  const fs = require('fs');\n  const path = require('path');\n  const outDir = $env.XRAY_OUT_DIR || '/data/xray-agent/out';\n  fs.mkdirSync(outDir, { recursive: true });\n  fs.appendFileSync(path.join(outDir, 'audit.jsonl'), JSON.stringify(record) + '\\n', 'utf8');\n  const stamp = record.timestamp.replace(/[:.]/g, '-');\n  fs.writeFileSync(path.join(outDir, `report-${stamp}-${$execution.id}.md`), redactPHI(j.markdown), 'utf8');\n  if (j.html) fs.writeFileSync(path.join(outDir, `report-${stamp}-${$execution.id}.html`), redactPHI(j.html), 'utf8');\n} catch (e) {\n  // Never fail the pipeline because of logging. Most likely cause:\n  // NODE_FUNCTION_ALLOW_BUILTIN=fs,path not set, or XRAY_OUT_DIR not writable.\n  console.log('AUDIT LOG WRITE FAILED (pipeline continues): ' + String(e && e.message ? e.message : e));\n}\n\n// Forward the full item so the Form completion node still has `html` to render\n// (dropping it here left the completion page blank).\nreturn [{ json: { ...j } }];\n"
+      }
+    },
+    {
+      "name": "Respond",
+      "type": "n8n-nodes-base.form",
+      "typeVersion": 1,
+      "position": [
+        1240,
+        0
+      ],
+      "parameters": {
+        "operation": "completion",
+        "respondWith": "showText",
+        "responseText": "={{ $json.html }}",
+        "options": {}
+      }
+    }
+  ],
+  "connections": {
+    "Intake Trigger": {
+      "main": [
+        [
+          {
+            "node": "Preprocess",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Preprocess": {
+      "main": [
+        [
+          {
+            "node": "Triage (Gemini)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Triage (Gemini)": {
+      "main": [
+        [
+          {
+            "node": "Parse Triage",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Triage": {
+      "main": [
+        [
+          {
+            "node": "Fan-out Critiques",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fan-out Critiques": {
+      "main": [
+        [
+          {
+            "node": "Merge Guard",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge Guard": {
+      "main": [
+        [
+          {
+            "node": "Any Critiques?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Any Critiques?": {
+      "main": [
+        [
+          {
+            "node": "Synthesis (DeepSeek)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Error Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Synthesis (DeepSeek)": {
+      "main": [
+        [
+          {
+            "node": "Parse & Validate Final",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse & Validate Final": {
+      "main": [
+        [
+          {
+            "node": "Render Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Error Report": {
+      "main": [
+        [
+          {
+            "node": "Render Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Render Report": {
+      "main": [
+        [
+          {
+            "node": "Audit Log",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Audit Log": {
+      "main": [
+        [
+          {
+            "node": "Respond",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataSuccessExecution": "all",
+    "saveDataErrorExecution": "all",
+    "saveManualExecutions": true,
+    "saveExecutionProgress": true
+  },
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "pinData": {}
+}

@@ -1,0 +1,14 @@
+{
+  "name": "xray-report-analyzer",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Multi-LLM X-Ray report analysis agent system for n8n (research/educational prototype — NOT a diagnostic device)",
+  "type": "module",
+  "scripts": {
+    "build": "node scripts/build-workflow.mjs",
+    "test": "node scripts/simulate-pipeline.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

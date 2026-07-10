@@ -1,0 +1,51 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "SpecialistCritique",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "specialty_role",
+    "key_observations",
+    "areas_of_concern",
+    "differential_considerations",
+    "confidence_level",
+    "disagreements_with_original_report",
+    "recommended_next_steps"
+  ],
+  "properties": {
+    "specialty_role": { "type": "string" },
+    "key_observations": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Findings this specialty considers salient, each grounded in the source."
+    },
+    "areas_of_concern": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Things worth flagging: ambiguous findings, missing views, absent priors, red flags."
+    },
+    "differential_considerations": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Plausible diagnoses this specialty would consider, most-to-least likely."
+    },
+    "confidence_level": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["level", "rationale"],
+      "properties": {
+        "level": { "type": "string", "enum": ["low", "medium", "high"] },
+        "rationale": { "type": "string" }
+      }
+    },
+    "disagreements_with_original_report": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Empty array if none. State the point of the original report you dispute and why."
+    },
+    "recommended_next_steps": {
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  }
+}

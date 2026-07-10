@@ -1,0 +1,73 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "FinalDiagnosticReport",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "summary",
+    "primary_findings",
+    "points_of_agreement",
+    "points_of_disagreement_and_resolution",
+    "most_likely_diagnosis",
+    "differential_diagnoses_ranked",
+    "confidence_assessment",
+    "recommended_next_clinical_steps",
+    "contributing_specialties",
+    "missing_critiques",
+    "disclaimer"
+  ],
+  "properties": {
+    "summary": { "type": "string" },
+    "primary_findings": { "type": "array", "items": { "type": "string" } },
+    "points_of_agreement": { "type": "array", "items": { "type": "string" } },
+    "points_of_disagreement_and_resolution": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["point", "positions", "resolution"],
+        "properties": {
+          "point": { "type": "string" },
+          "positions": { "type": "array", "items": { "type": "string" } },
+          "resolution": { "type": "string" }
+        }
+      }
+    },
+    "most_likely_diagnosis": { "type": "string" },
+    "differential_diagnoses_ranked": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["diagnosis", "likelihood", "supporting_rationale"],
+        "properties": {
+          "diagnosis": { "type": "string" },
+          "likelihood": { "type": "string", "enum": ["high", "moderate", "low"] },
+          "supporting_rationale": { "type": "string" }
+        }
+      }
+    },
+    "confidence_assessment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["overall_confidence", "rationale", "analysis_limitations"],
+      "properties": {
+        "overall_confidence": { "type": "string", "enum": ["low", "medium", "high"] },
+        "rationale": { "type": "string" },
+        "analysis_limitations": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "e.g. 'two of three agents analyzed report text only, not the image'."
+        }
+      }
+    },
+    "recommended_next_clinical_steps": { "type": "array", "items": { "type": "string" } },
+    "contributing_specialties": { "type": "array", "items": { "type": "string" } },
+    "missing_critiques": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Names/backends of any specialist that failed or timed out; empty if all ran."
+    },
+    "disclaimer": { "type": "string", "description": "Mandatory Section 6 text, verbatim." }
+  }
+}

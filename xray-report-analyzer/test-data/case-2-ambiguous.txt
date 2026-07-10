@@ -1,0 +1,18 @@
+EXAM: Chest radiograph, PA view only.
+
+CLINICAL INDICATION: Cough for five days, low-grade fever.
+
+COMPARISON: None available.
+
+FINDINGS:
+There is a vague, hazy opacity in the left lower zone that may represent an
+early infiltrate versus overlying soft tissue or breast shadow artifact. The
+finding is subtle and of uncertain significance on this single view. The
+remainder of the lungs is clear. Cardiac silhouette is at the upper limit of
+normal. No pleural effusion or pneumothorax. Osseous structures are
+unremarkable.
+
+IMPRESSION:
+1. Possible early left lower lobe infiltrate versus artifact; a lateral view
+   and/or short-interval follow-up radiograph is suggested for clarification.
+2. Borderline cardiac silhouette, likely technical/positional.
