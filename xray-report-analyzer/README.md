@@ -7,20 +7,7 @@ backends (Gemini, local Ollama, DeepSeek), implementing `AGENT_SYSTEM_SPEC.md`
 section numbers cited below, e.g. "§2.6", refer to it).
 
 ```text
-──────────────────────────────────────────────────────────────────────────
-⚠  IMPORTANT — READ BEFORE USE
-This report was produced by an AI-assisted research/educational tool. It is
-NOT a certified diagnostic device and must not be treated as one.
 
-• All output must be reviewed and confirmed by a licensed radiologist or
-  physician before ANY clinical decision is made.
-• This system must never be deployed to make diagnostic or treatment
-  decisions autonomously. A qualified human must remain in the loop at all
-  times.
-• No real patient-identifying information should be entered, stored, or
-  logged. All test and demonstration data must be de-identified.
-──────────────────────────────────────────────────────────────────────────
-```
 
 **Design principle: scoped, auditable access beats blanket permissions for both
 security and reliability.** This system is never granted "all permissions."
